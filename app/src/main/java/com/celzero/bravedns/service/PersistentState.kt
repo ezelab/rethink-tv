@@ -23,6 +23,7 @@ import com.celzero.bravedns.data.AppConfig
 import com.celzero.bravedns.database.DnsCryptRelayEndpoint
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
 import com.celzero.bravedns.ui.activity.AntiCensorshipActivity
+import com.celzero.bravedns.ui.bottomsheet.BlockFreeDnsModeBottomSheet
 import com.celzero.bravedns.util.Constants
 import com.celzero.bravedns.util.Constants.Companion.INIT_TIME_MS
 import com.celzero.bravedns.util.Constants.Companion.INVALID_PORT
@@ -44,7 +45,6 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     companion object {
         const val BRAVE_MODE = "brave_mode"
         const val BACKGROUND_MODE = "background_mode"
-        const val ALLOW_BYPASS = "allow_bypass"
         const val LOCAL_BLOCK_LIST = "enable_local_list"
         const val LOCAL_BLOCK_LIST_STAMP = "local_block_list_stamp"
         const val LOCAL_BLOCK_LIST_UPDATE = "local_block_list_downloaded_time"
@@ -81,7 +81,6 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
         const val TUN_NETWORK_POLICY = "tun_network_handling_policy"
         const val USE_MAX_MTU = "use_max_mtu"
         const val SET_VPN_BUILDER_TO_METERED = "set_vpn_builder_to_metered"
-        const val PANIC_RANDOM = "panic_random"
 
         // SE Proxy for Anti-Censorship
         const val AUTO_PROXY_ENABLED = "auto_proxy_enabled"
@@ -104,6 +103,14 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
         // Any stored version lower than this will cause the tour to re-trigger.
         // v2: added Rethink+ premium nav-item step (step 6) + fixed tour button text contrast.
         const val GUIDED_TOUR_CURRENT_VERSION = 2
+
+        const val FLOOD_WIREGUARD = "flood_wireguard"
+
+        const val SOCKET_BUFFER_SIZE_BYTES = "socket_buffer_size_bytes"
+
+        const val INCLUDE_FILE_TRACE = "include_file_trace"
+
+        const val GO_MAX_MEMORY = "go_max_memory"
     }
 
     // when vpn is started by the user, this is set to true; set to false when user stops
@@ -410,9 +417,10 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     // Empty string means no block-free DNS configured
     var blockFreeDns by stringPref("block_free_dns").withDefault<String>("")
 
-    // DNS bypass mode for block-free DNS: 1=fallback, 2=global, 3=none
-    // Default is 1 (Use fallback as DNS)
-    var blockFreeDnsMode by intPref("block_free_dns_mode").withDefault<Int>(1)
+    // DNS bypass mode for block-free DNS: 1=fallback, 2=global, 3=auto
+    // Default is 3 (auto) which means use dns will be decided based on other dns settings
+    var blockFreeDnsMode by intPref("block_free_dns_mode").withDefault<Int>(
+        BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.AUTO.mode)
 
     // Firebase error reporting enabled (only for play and website variants)
     var firebaseErrorReportingEnabled by booleanPref("firebase_error_reporting").withDefault<Boolean>(Utilities.isPlayStoreFlavour())
@@ -434,18 +442,25 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     // set vpn builder to metered/unmetered
     var setVpnBuilderToMetered by booleanPref("set_vpn_builder_to_metered").withDefault<Boolean>(false)
 
-    // debug settings, panic random
-    var panicRandom by booleanPref("panic_random").withDefault<Boolean>(false)
-
     // global lockdown for wireguard proxy
     var wgGlobalLockdown by booleanPref("wg_global_lockdown").withDefault<Boolean>(false)
 
     // smart persistent keep alive for wireguard proxy
     var smartPersistentKeepalive by booleanPref("smart_persistent_keepalive").withDefault<Boolean>(false)
 
+    // true once the encrypted wireguard config files have been migrated to plain files
+    var wireguardPlainFileMigrationDone by booleanPref("wg_plain_file_migration_done").withDefault<Boolean>(false)
+
     var appTestMode by booleanPref("app_test_mode").withDefault<Boolean>(false)
 
     var advSettingForcePTMode by booleanPref("adv_setting_force_pt_mode").withDefault<Boolean>(false)
+
+    var floodWireGuard by booleanPref("flood_wireguard").withDefault(false)
+
+    var socketBufferSizeBytes by intPref("socket_buffer_size_bytes").withDefault<Int>(524288) // 512 KB (512 * 1024)
+
+    // include file trace in logs
+    var includeFileTrace by booleanPref(INCLUDE_FILE_TRACE).withDefault<Boolean>(false)
 
     var orbotConnectionStatus: MutableLiveData<Boolean> = MutableLiveData()
     var vpnEnabledLiveData: MutableLiveData<Boolean> = MutableLiveData()
@@ -746,4 +761,11 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
 
     // the version of the guided tour that was last shown; used to re-trigger on UI changes
     var guidedTourVersion by intPref("guided_tour_version").withDefault<Int>(0)
+
+    // maximum memory the go engine can consume in bytes (ideally value*1024*1024)
+    var goMaxMemory by longPref(GO_MAX_MEMORY).withDefault<Long>(-1L)
+
+    var blockDnsForUnknownApp by booleanPref("block_dns_for_unknown_app").withDefault<Boolean>(false)
+
+    var showRethinkBlockNotification by booleanPref("show_rethink_block_notification").withDefault<Boolean>(true)
 }

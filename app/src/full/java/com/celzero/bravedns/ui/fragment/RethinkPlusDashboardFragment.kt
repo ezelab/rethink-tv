@@ -30,6 +30,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.navigation.fragment.findNavController
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.celzero.bravedns.R
+import com.celzero.bravedns.RethinkDnsApplication.Companion.DEBUG
 import com.celzero.bravedns.database.SubscriptionStatus
 import com.celzero.bravedns.database.SubscriptionStatusDao
 import com.celzero.bravedns.databinding.ActivityRethinkPlusDashboardBinding
@@ -39,12 +40,14 @@ import com.celzero.bravedns.iab.PurchaseConflictNotifier
 import com.celzero.bravedns.iab.ServerApiError
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
 import com.celzero.bravedns.rpnproxy.SubscriptionStateMachineV2
+import com.celzero.bravedns.service.VpnController
 import com.celzero.bravedns.ui.activity.CustomerSupportActivity
 import com.celzero.bravedns.ui.activity.FragmentHostActivity
 import com.celzero.bravedns.ui.activity.PingTestActivity
 import com.celzero.bravedns.ui.activity.ServerOrderHistoryActivity
 import com.celzero.bravedns.ui.bottomsheet.DeviceAuthErrorBottomSheet
 import com.celzero.bravedns.ui.bottomsheet.DeviceNotRegisteredBottomSheet
+import com.celzero.bravedns.ui.bottomsheet.EntitlementDetailBottomSheet
 import com.celzero.bravedns.ui.bottomsheet.ManageRpnPurchaseBtmSht
 import com.celzero.bravedns.ui.bottomsheet.PurchaseConflictBottomSheet
 import com.celzero.bravedns.util.Utilities.showToastUiCentered
@@ -68,15 +71,6 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
         private const val ONE_DAY_MS = 24 * 60 * 60 * 1000L
     }
 
-    private fun safeNavigate(actionId: Int) {
-        try {
-            findNavController().navigate(actionId)
-        } catch (_: IllegalStateException) {
-            Logger.w(LOG_TAG_UI, "$TAG safeNavigate: no NavController (action=$actionId)")
-            requireActivity().finish()
-        }
-    }
-
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         if (!isAdded) return
@@ -90,6 +84,11 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
     private fun initView() {
         setupToolbar()
         loadSubscriptionBanner()
+        if (DEBUG) {
+            b.entitlementRl.visibility = View.VISIBLE
+        } else {
+            b.entitlementRl.visibility = View.GONE
+        }
     }
 
     private fun applyScrollPadding() {
@@ -110,7 +109,7 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
     }
 
     private fun setupToolbar() {
-        b.collapsingToolbar.title = getString(R.string.rpn_title)
+        b.collapsingToolbar.title = getString(R.string.proxy_rpn_heading)
     }
 
     /**
@@ -152,6 +151,18 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
             else -> getString(R.string.rpn_title)
         }
 
+        io {
+            val expiry = VpnController.getWinExpiryTs()
+            val hex = expiry?.toString(16)
+            uiCtx {
+                if (hex == null) {
+                    b.tvHeroExpiry.visibility = View.GONE
+                } else {
+                    b.tvHeroExpiry.visibility = View.VISIBLE
+                    b.tvHeroExpiry.text = hex
+                }
+            }
+        }
         val subscriptionData  = RpnProxyManager.getSubscriptionData()
         val displayPlan = resolvePlanName(subscriptionData)
         b.tvDetailPlan.text = displayPlan
@@ -174,9 +185,6 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
         if (hasKnownExpiry) {
             b.tvDetailExpiry.text = fmt.format(Date(sub.billingExpiry))
         }
-
-        // Renew CTA
-        b.renewButton.isVisible = !state.hasValidSubscription
 
         // Expiring-soon banner - only for active INAPP purchases within 30 days of expiry
         updateExpiringBanner(subscriptionData, state)
@@ -221,8 +229,8 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
                         return@uiCtx
                     }
                     val isExpiringSoon = remainingDays in 0..EXPIRING_SOON_THRESHOLD_DAYS
-                    b.expiringBannerCard.isVisible = isExpiringSoon || true
-                    if (isExpiringSoon || true) {
+                    b.expiringBannerCard.isVisible = isExpiringSoon || DEBUG
+                    if (isExpiringSoon || DEBUG) {
                         val days = remainingDays.coerceAtLeast(0L)
                         b.tvExpiringBanner.text = getString(R.string.inapp_expiry_soon, days)
                         b.btnExtendAccess.setOnClickListener { navigateToOneTimePurchase() }
@@ -297,7 +305,6 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
                 val deviceId = runCatching { InAppBillingHandler.getObfuscatedDeviceId() }.getOrDefault("")
                 uiCtx {
                     populateBanner(sub, state, deviceId)
-                    handleStateChange(state)
                 }
             }
         }
@@ -349,30 +356,6 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
         sheet.show(childFragmentManager, "conflict409")
     }
 
-
-    private fun handleStateChange(state: SubscriptionStateMachineV2.SubscriptionState) {
-        when (state) {
-            is SubscriptionStateMachineV2.SubscriptionState.Active,
-            is SubscriptionStateMachineV2.SubscriptionState.Grace -> {
-                b.renewButton.isVisible = false
-            }
-            is SubscriptionStateMachineV2.SubscriptionState.Cancelled -> {
-                b.renewButton.isVisible = true
-            }
-            is SubscriptionStateMachineV2.SubscriptionState.Revoked -> {
-                b.renewButton.isVisible = true
-            }
-            is SubscriptionStateMachineV2.SubscriptionState.Expired -> {
-                b.renewButton.isVisible = true
-            }
-            is SubscriptionStateMachineV2.SubscriptionState.Uninitialized,
-            is SubscriptionStateMachineV2.SubscriptionState.Initial -> {
-                // transient, ignore
-            }
-            else -> Logger.d(LOG_TAG_UI, "$TAG state: ${state.javaClass.simpleName}")
-        }
-    }
-
     private fun setupClickListeners() {
         b.pingTestRl.setOnClickListener {
             startActivity(Intent(requireContext(), PingTestActivity::class.java))
@@ -380,8 +363,8 @@ class RethinkPlusDashboardFragment : Fragment(R.layout.activity_rethink_plus_das
         b.manageSubsRl.setOnClickListener { managePlayStoreSubs() }
         b.serverOrderHistoryRl.setOnClickListener { openServerOrderHistory() }
         b.reportIssueRl.setOnClickListener { CustomerSupportActivity.start(requireContext()) }
-        b.renewButton.setOnClickListener {
-            safeNavigate(R.id.action_rethinkPlusDashboard_to_rethinkPlus)
+        b.entitlementRl.setOnClickListener {
+            EntitlementDetailBottomSheet.newInstance().show(childFragmentManager, "entitlementDetails")
         }
     }
 

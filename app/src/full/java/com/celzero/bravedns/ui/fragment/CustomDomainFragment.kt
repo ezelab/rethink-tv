@@ -24,7 +24,6 @@ import android.widget.Toast
 import androidx.appcompat.widget.SearchView
 import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.Fragment
-import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -52,7 +51,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
-import java.net.URI
 
 class CustomDomainFragment :
     Fragment(R.layout.fragment_custom_domain), SearchView.OnQueryTextListener {
@@ -128,8 +126,8 @@ class CustomDomainFragment :
         adapter = CustomDomainAdapter(requireContext(), this, rule, eventLogger)
         b.cdaRecycler.adapter = adapter
         viewModel.setUid(uid)
-        viewModel.customDomains.observe(this as LifecycleOwner) {
-            adapter.submitData(this.lifecycle, it)
+        viewModel.customDomains.observe(viewLifecycleOwner) {
+            adapter.submitData(viewLifecycleOwner.lifecycle, it)
         }
         io {
             val appName = FirewallManager.getAppNameByUid(uid)
@@ -156,8 +154,8 @@ class CustomDomainFragment :
         observeAllRules()
         adapter = CustomDomainAdapter(requireContext(), this, rule, eventLogger)
         b.cdaRecycler.adapter = adapter
-        viewModel.allDomainRules.observe(this as LifecycleOwner) {
-            adapter.submitData(this.lifecycle, it)
+        viewModel.allDomainRules.observe(viewLifecycleOwner) {
+            adapter.submitData(viewLifecycleOwner.lifecycle, it)
         }
     }
 

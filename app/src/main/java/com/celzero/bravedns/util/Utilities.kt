@@ -40,6 +40,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.text.TextUtils
 import android.text.TextUtils.SimpleStringSplitter
+import android.util.LruCache
 import android.view.accessibility.AccessibilityManager
 import android.widget.Toast
 import androidx.appcompat.content.res.AppCompatResources
@@ -85,6 +86,7 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.ln
 import kotlin.math.pow
+import kotlin.time.Duration.Companion.milliseconds
 
 @Suppress("TooManyFunctions", "LargeClass")
 object Utilities {
@@ -106,7 +108,7 @@ object Utilities {
             val name: InternetDomainName = InternetDomainName.from(fqdn)
             try {
                 name.topPrivateDomain().toString()
-            } catch (e: IllegalStateException) {
+            } catch (_: IllegalStateException) {
                 // The name doesn't end in a recognized TLD.  This can happen for randomly
                 // generated
                 // names, or when new TLDs are introduced.
@@ -121,7 +123,7 @@ object Utilities {
                     fqdn
                 }
             }
-        } catch (e: IllegalArgumentException) {
+        } catch (_: IllegalArgumentException) {
             // If fqdn is not a valid domain name, InternetDomainName.from() will throw an
             // exception.  Since this function is only for aesthetic purposes, we can
             // return the input unmodified in this case.
@@ -455,16 +457,20 @@ object Utilities {
         // For versions prior to 29 the check is made with Settings.Secure.
         // In our case, the always-on check is for all the vpn profiles. So using
         // vpnService?.isAlwaysOn will not be much helpful
-        if (isAtleastQ()) {
-            return vpnService?.isAlwaysOn == true
-        }
 
+        // Try Settings.Secure first so the check works even when the VPN service is not
+        // bound (e.g. immediately after reboot). On some Android versions this key is
+        // hidden/restricted, so fall back to the service property when available.
         return try {
             val alwaysOn = Settings.Secure.getString(context.contentResolver, "always_on_vpn_app")
             context.packageName == alwaysOn
         } catch (e: Exception) { // Catches SecurityException and other Settings-related exceptions
-            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}", e)
-            false
+            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}")
+            if (isAtleastQ()) {
+                vpnService?.isAlwaysOn == true
+            } else {
+                false
+            }
         }
     }
 
@@ -475,37 +481,79 @@ object Utilities {
             val alwaysOn = Settings.Secure.getString(context.contentResolver, "always_on_vpn_app")
             !TextUtils.isEmpty(alwaysOn) && context.packageName != alwaysOn
         } catch (e: Exception) { // Catches SecurityException and other Settings-related exceptions
-            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}", e)
+            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}")
             false
         }
     }
 
-    fun getIcon(ctx: Context, packageName: String, appName: String? = null): Drawable? {
-        if (!isValidAppName(appName, packageName)) {
-            return getDefaultIcon(ctx)
-        }
+    object AppIconCache {
+        private const val CACHE_SIZE = 500
 
-        return try {
-            ctx.packageManager.getApplicationIcon(packageName)
-        } catch (e: PackageManager.NameNotFoundException) {
-            // Not adding exception details in logs.
-            Logger.e(LOG_TAG_FIREWALL, "no app icon for $packageName" + e.message)
-            getDefaultIcon(ctx)
+        private val cache =
+            LruCache<String, Drawable.ConstantState>(CACHE_SIZE)
+
+        fun get(
+            context: Context,
+            packageName: String,
+            appName: String? = null
+        ): Drawable? {
+            cache.get(packageName)?.let {
+                return it.newDrawable(context.resources)
+            }
+
+            if (!isValidAppName(appName, packageName)) {
+                return getDefaultIcon(context)
+            }
+
+            val drawable = try {
+                context.applicationContext.packageManager
+                    .getApplicationIcon(packageName)
+            } catch (_: PackageManager.NameNotFoundException) {
+                return getDefaultIcon(context)
+            }
+
+            drawable.constantState?.let {
+                cache.put(packageName, it)
+            }
+
+            return drawable
         }
+    }
+
+    // Backward-compatible wrapper that delegates to AppIconCache.
+    fun getIcon(
+        ctx: Context,
+        packageName: String,
+        appName: String? = null
+    ): Drawable? {
+        return AppIconCache.get(ctx, packageName, appName)
     }
 
     private fun isValidAppName(appName: String?, packageName: String): Boolean {
         return !isNonApp(packageName) && Constants.UNKNOWN_APP != appName
     }
 
+    private var defaultIconState: Drawable.ConstantState? = null
+
     fun getDefaultIcon(context: Context): Drawable? {
-        return AppCompatResources.getDrawable(context, R.drawable.default_app_icon)
+        defaultIconState?.let {
+            return it.newDrawable(context.resources)
+        }
+
+        val drawable = AppCompatResources.getDrawable(
+            context,
+            R.drawable.default_app_icon
+        )
+
+        defaultIconState = drawable?.constantState
+
+        return drawable
     }
 
     @Suppress("TooGenericExceptionCaught")
     fun delay(ms: Long, scope: LifecycleCoroutineScope, updateUi: () -> Unit) {
         scope.launch {
-            kotlinx.coroutines.delay(ms)
+            kotlinx.coroutines.delay(ms.milliseconds)
             try {
                 updateUi()
             } catch (e: Exception) { // Catches any exception from user-provided updateUi lambda
@@ -575,6 +623,10 @@ object Utilities {
 
     fun isPlayStoreFlavour(): Boolean {
         return BuildConfig.FLAVOR_releaseChannel == FLAVOR_PLAY
+    }
+
+    fun isWebsiteDegoogledFlavour(): Boolean {
+        return isFdroidFlavour() && BuildConfig.IS_WEBSITE_DEGOOGLD_BUILD
     }
 
 

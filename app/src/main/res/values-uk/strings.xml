@@ -580,7 +580,6 @@
     <string name="settings_custom_downloader_desc" translatable="true">Якщо вимкнено, використовуватиметься вбудований <i>Менеджер завантажень</i> Android</string>
     <string name="settings_https_disabled_error" translatable="true">Підключено до %1$s. Вимкніть, щоб продовжити.</string>
     <string name="settings_network_all_networks_desc" translatable="true">Коли ввімкнено, Rethink використовуватиме всі доступні мережі для підключення до Інтернету. Якщо вимкнено, він використовуватиме ту мережу, яка вважається <i>активною</i> операційною системою Android.</string>
-    <string name="settings_rinr_dialog_title" translatable="true">Зворотний цикл (експериментально)</string>
     <string name="settings_socks5_disabled_error" translatable="true">Підключено до %1$s. Вимкніть, щоб продовжити.</string>
     <string name="settings_app_notification_persistent_heading" translatable="true">Постійне повідомлення</string>
     <string name="settings_app_notification_persistent_desc" translatable="true">Зробити повідомлення постійним</string>
@@ -647,7 +646,6 @@
     <string name="about_mail_to_string" translatable="true">Посилання mailTO:</string>
     <string name="settings_exclude_proxy_apps_heading" translatable="true">Застосунки переадресації проксі-серверів зі зворотним зв\'язком</string>
     <string name="settings_exclude_proxy_apps_desc" translatable="true">Коли цей параметр вимкнено, супроводження застосунків до проксі-серверів (SОСКS5, НТТР, DNS) виключається з VPN-тунелів Rethink\'s.</string>
-    <string name="settings_rinr_dialog_desc" translatable="true">Також вмикає<!--settings_network_all_networks--> %1$s налаштування. Ви бажаєте продовжити?</string>
     <string name="settings_ip_dialog_ipv4" translatable="true">IPv4 (стандарт)</string>
     <string name="settings_socks5_dialog_hint_port" translatable="true">Порт</string>
     <string name="settings_selected_theme" translatable="true">Поточна тема: %1$s</string>
@@ -938,7 +936,6 @@
     <string name="hsf_blocklist_chip_text_no_data" translatable="true">Увімкнути RDNS+</string>
     <string name="hsf_exclude_error" translatable="true">Вимкнути неможливо в режимі \"блокування без VPN\"</string>
     <string name="hsf_proxy_chip_removed_toast" translatable="true">Проксі вилучено</string>
-    <string name="hsf_proxy_chip_remove_text" translatable="true">Припинення…</string>
     <string name="lbl_battery_optimization" translatable="true">Оптимізація акумулятора</string>
     <string name="battery_optimization_dialog_heading" translatable="true">Вимкнути %1$s</string>
     <string name="dc_local_block_desc_1" translatable="true">Виберіть з 195+ блоклистів. Натисніть тут, щоб завантажити або налаштувати їх.</string>
@@ -1080,8 +1077,6 @@
     <string name="dc_filtering_heading" translatable="true">фільтрація</string>
     <string name="cd_split_dns_heading" translatable="true">Розділений DNS (експериментальний)</string>
     <string name="cd_split_dns_desc" translatable="true">Пересилати DNS-запити від проксі-програм на DNS-сервери проксі-сервера.</string>
-    <string name="cd_treat_dns_rules_firewall_heading" translatable="true">Розглядати правила DNS як правила брандмауера (експериментально)</string>
-    <string name="cd_treat_dns_rules_firewall_desc" translatable="true">Блокування DNS буде обійдено під час вирішення проблеми; рішення буде прийнято під час підключення.</string>
     <string name="univ_firewall_rule_11" translatable="true">Блокувати всі підключення до локального хоста</string>
     <string name="firewall_rule_private_dns" translatable="true">Приватний DNS</string>
     <string name="firewall_rule_bypass_proxy" translatable="true">Обхід проксі-сервера</string>

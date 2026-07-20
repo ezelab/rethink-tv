@@ -19,14 +19,12 @@ import Logger
 import Logger.LOG_IAB
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.LiveData
 import androidx.lifecycle.viewModelScope
 import com.android.billingclient.api.BillingClient.ProductType
 import com.celzero.bravedns.iab.InAppBillingHandler
 import com.celzero.bravedns.iab.ProductDetail
 import com.celzero.bravedns.rpnproxy.PipKeyManager
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
-import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.rpnproxy.SubscriptionStateMachineV2
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,7 +39,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.koin.core.component.KoinComponent
-import org.koin.core.component.inject
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * ViewModel for Rethink Plus subscription management
@@ -74,9 +72,6 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
     // Polling job for pending purchases
     private var pollingJob: Job? = null
     private var pollingStartTime = 0L
-
-    val subscriptionState: LiveData<SubscriptionStateMachineV2.SubscriptionState> =
-        InAppBillingHandler.getSubscriptionStateLiveData()
 
     companion object {
         private const val TAG = "RethinkPlusVM"
@@ -300,7 +295,7 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
 
         // Auto-select first product if available
         if (filtered.isNotEmpty()) {
-            val first = filtered.first()
+            val first = filtered.last()
             _selectedProduct.value = Pair(first.productId, first.planId)
         }
     }
@@ -341,6 +336,23 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
     // Job that watches oneTimePurchaseCompletedFlow while an extend-mode purchase is in flight.
     // Canceled when the flow resolves (success or error) or the ViewModel is cleared.
     private var extendObserverJob: Job? = null
+
+    /**
+     * Called by the Fragment when a billing transaction error fires while in extend mode.
+     * The state machine stays in [SubscriptionStateMachineV2.SubscriptionState.Active]
+     * (no PurchaseFailed transition exists from Active), so [observeSubscriptionState] never
+     * sees an Error state and cannot clean up the extend-mode flow flags itself.
+     * This method must be called explicitly from the Fragment's transactionErrorLiveData
+     * observer so [purchaseFlowActive] and [extendObserverJob] are always reset on failure.
+     */
+    fun onTransactionError() {
+        if (purchaseFlowActive) {
+            Logger.d(LOG_IAB, "$TAG: onTransactionError: clearing purchaseFlowActive (extendMode=$extendMode)")
+            purchaseFlowActive = false
+            extendObserverJob?.cancel()
+            extendObserverJob = null
+        }
+    }
 
     fun markPurchaseFlowActive() {
         purchaseFlowActive = true
@@ -523,7 +535,7 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
 
                 Logger.d(LOG_IAB, "$TAG: Polling pending purchase, elapsed: $elapsedTime ms")
                 InAppBillingHandler.fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
-                delay(POLLING_INTERVAL_MS)
+                delay(POLLING_INTERVAL_MS.milliseconds)
             }
         }
     }
@@ -539,9 +551,6 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
 
     /**
      * Handle billing connection result.
-     * BUG FIX: previously only fetched purchases on connect, never queried product details →
-     * if the billing client was not yet ready when initializeBilling() ran, products were never
-     * loaded and the UI stayed in Loading forever.
      */
     fun onBillingConnected(isSuccess: Boolean, message: String) {
         if (!isSuccess) {
@@ -570,11 +579,16 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
                     isBillingInitializing = false
                     withContext(Dispatchers.Main) {
                         _uiState.value = SubscriptionUiState.AlreadySubscribed(
-                            RpnProxyManager.getRpnProductId() ?: ""
+                            RpnProxyManager.getRpnProductId()
                         )
                     }
                     return@launch
                 }
+
+                // Fetch existing purchases to sync state machine, then query displayable products.
+                // regardless of availability, the previous purchases should be fetched and
+                // see if any active purchases are there
+                InAppBillingHandler.fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
 
                 // Check availability before querying products.
                 val avd = checkAvailability()
@@ -591,8 +605,6 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
                     return@launch
                 }
 
-                // Fetch existing purchases to sync state machine, then query displayable products.
-                InAppBillingHandler.fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
                 InAppBillingHandler.queryProductDetailsWithTimeout()
                 // isBillingInitializing cleared by onProductsFetched
             }
@@ -608,7 +620,7 @@ class RethinkPlusViewModel(application: Application) : AndroidViewModel(applicat
         if (!isSuccess || productList.isEmpty()) {
             _uiState.value = SubscriptionUiState.Error(
                 title = "Products Unavailable",
-                message = "Unable to load subscription plans. Please try again.",
+                message = "Unable to load plans. Please try again.",
                 isRetryable = true
             )
         } else {

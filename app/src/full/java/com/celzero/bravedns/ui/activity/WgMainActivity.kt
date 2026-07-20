@@ -27,7 +27,6 @@ import android.view.View
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
-import com.celzero.bravedns.ui.BaseActivity
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
@@ -44,6 +43,7 @@ import com.celzero.bravedns.databinding.ActivityWireguardMainBinding
 import com.celzero.bravedns.service.EventLogger
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.WireguardManager
+import com.celzero.bravedns.ui.BaseActivity
 import com.celzero.bravedns.util.QrCodeFromFileScanner
 import com.celzero.bravedns.util.Themes
 import com.celzero.bravedns.util.TunnelImporter
@@ -76,13 +76,21 @@ class WgMainActivity :
     private val wgConfigViewModel: WgConfigViewModel by viewModel()
 
     companion object {
-        private const val IMPORT_LAUNCH_INPUT = "*/*"
+        private val IMPORT_LAUNCH_INPUT = arrayOf("*/*")
     }
 
     private val tunnelFileImportResultLauncher =
-        registerForActivityResult(ActivityResultContracts.GetContent()) { data ->
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { data ->
             if (data == null) return@registerForActivityResult
             val contentResolver = contentResolver ?: return@registerForActivityResult
+            try {
+                contentResolver.takePersistableUriPermission(
+                    data,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: SecurityException) {
+                Logger.w(LOG_TAG_PROXY, "Could not persist URI permission for $data", e)
+            }
             lifecycleScope.launch {
                 if (QrCodeFromFileScanner.validContentType(contentResolver, data)) {
                     try {
@@ -170,7 +178,7 @@ class WgMainActivity :
 
         if (isAtleastQ()) {
             val controller = WindowInsetsControllerCompat(window, window.decorView)
-            controller.isAppearanceLightNavigationBars = false
+            controller.isAppearanceLightNavigationBars = Themes.isActivityLightTheme(isDarkThemeOn(), persistentState.theme)
             window.isNavigationBarContrastEnforced = false
         }
 

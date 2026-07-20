@@ -47,15 +47,15 @@ import com.celzero.bravedns.service.VpnController
 import com.celzero.bravedns.service.WireguardManager
 import com.celzero.bravedns.ui.activity.ConfigureRethinkBasicActivity
 import com.celzero.bravedns.ui.activity.DnsListActivity
-import com.celzero.bravedns.ui.bottomsheet.BlockFreeDnsModeBottomSheet
 import com.celzero.bravedns.ui.activity.PauseActivity
+import com.celzero.bravedns.ui.bottomsheet.BlockFreeDnsModeBottomSheet
 import com.celzero.bravedns.ui.bottomsheet.DnsRecordTypesBottomSheet
 import com.celzero.bravedns.ui.bottomsheet.LocalBlocklistsBottomSheet
 import com.celzero.bravedns.util.NewSettingsManager
+import com.celzero.bravedns.util.SnackbarHelper
 import com.celzero.bravedns.util.UIUtils
 import com.celzero.bravedns.util.UIUtils.fetchColor
 import com.celzero.bravedns.util.UIUtils.setBadgeDotVisible
-import com.celzero.bravedns.util.SnackbarHelper
 import com.celzero.bravedns.util.Utilities
 import com.celzero.bravedns.util.Utilities.isAtleastR
 import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
@@ -109,15 +109,6 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
         updateAllowedRecordTypesUi()
         // update block-free dns ui
         updateBlockFreeDnsUi()
-        showNewBadgeIfNeeded()
-    }
-
-
-    private fun showNewBadgeIfNeeded() {
-        val showBadge = NewSettingsManager.shouldShowBadge(NewSettingsManager.BLOCK_DNS_QTYPE_SETTING)
-        if (!showBadge) return
-
-        b.dcAllowedRecordTypesHeading.setBadgeDotVisible(requireContext(), true)
     }
 
 
@@ -138,6 +129,8 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
         b.dcUndelegatedDomainsSwitch.isChecked = persistentState.useSystemDnsForUndelegatedDomains
         b.connectedStatusTitle.text = getConnectedDnsType()
         b.dcUseFallbackToBypassSwitch.isChecked = persistentState.useFallbackDnsToBypass
+        b.dcBlockUnknownSwitch.isChecked = persistentState.blockDnsForUnknownApp
+        b.dcPreventDnsLeaksSwitch.isChecked = persistentState.preventDnsLeaks
         showSplitDnsUi()
         updateAllowedRecordTypesUi()
     }
@@ -270,17 +263,7 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
             } else {
                 Backend.Preferred
             }
-            val dnsId = if (WireguardManager.oneWireGuardEnabled()) {
-                val id = WireguardManager.getOneWireGuardProxyId()
-                if (id == null) {
-                    prefId
-                } else {
-                    "${ProxyManager.ID_WG_BASE}${id}"
-                }
-            } else {
-                prefId
-            }
-            val p50 = VpnController.p50(dnsId)
+            val p50 = VpnController.p50(prefId)
             if (p50 <= 0L) return@io
 
             uiCtx {
@@ -332,14 +315,6 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
 
     private fun updateConnectedStatus(connectedDns: String) {
         var dnsType = resources.getString(R.string.configure_dns_connected_dns_proxy_status)
-        if (WireguardManager.oneWireGuardEnabled()) {
-            b.connectedStatusTitleUrl.text =
-                resources.getString(R.string.configure_dns_connected_dns_proxy_status)
-            b.connectedStatusTitle.text = resources.getString(R.string.lbl_wireguard)
-            updateLatency()
-            return
-        }
-
         var dns = connectedDns
         if (persistentState.splitDns && WireguardManager.isAdvancedWgActive()) {
             dns += ", " + resources.getString(R.string.lbl_wireguard)
@@ -408,16 +383,6 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
     }
 
     private fun updateSelectedDns() {
-        if (WireguardManager.oneWireGuardEnabled()) {
-            b.wireguardRb.visibility = View.VISIBLE
-            b.wireguardRb.isChecked = true
-            b.wireguardRb.isChecked = true
-            b.wireguardRb.isEnabled = true
-            disableAllDns()
-            return
-        }
-
-        b.wireguardRb.visibility = View.GONE
         if (isSmartDns()) {
             b.smartDnsRb.isChecked = true
             b.rethinkPlusDnsRb.isChecked = false
@@ -444,23 +409,6 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
             b.smartDnsRb.isChecked = false
             b.customDnsRb.isChecked = true
         }
-    }
-
-    private fun disableAllDns() {
-        b.rethinkPlusDnsRb.isChecked = false
-        b.customDnsRb.isChecked = false
-        b.networkDnsRb.isChecked = false
-        b.smartDnsRb.isChecked = false
-
-        b.rethinkPlusDnsRb.isEnabled = false
-        b.customDnsRb.isEnabled = false
-        b.networkDnsRb.isEnabled = false
-        b.smartDnsRb.isEnabled = false
-
-        b.rethinkPlusDnsRb.isClickable = false
-        b.customDnsRb.isClickable = false
-        b.networkDnsRb.isClickable = false
-        b.smartDnsRb.isClickable = false
     }
 
     private fun getConnectedDnsType(): String {
@@ -716,6 +664,16 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
         b.dcBlockFreeDnsRl.setOnClickListener {
             showBlockFreeDnsModeBottomSheet()
         }
+
+        b.dcBlockUnknownSwitch.setOnCheckedChangeListener { _, isChecked ->
+            persistentState.blockDnsForUnknownApp = isChecked
+            logEvent(
+                "block unknown apps? $isChecked",
+                "User changed block unknown apps setting to $isChecked"
+            )
+        }
+
+        b.dcBlockHeadingRl.setOnClickListener { b.dcBlockUnknownSwitch.isChecked = !b.dcBlockUnknownSwitch.isChecked }
     }
 
     private fun showBlockFreeDnsModeBottomSheet() {
@@ -853,9 +811,9 @@ class DnsSettingsFragment : Fragment(R.layout.fragment_dns_configure),
     private fun updateBlockFreeDnsUi() {
         val mode = BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.fromMode(persistentState.blockFreeDnsMode)
         b.dcBlockFreeDnsDesc.text = when (mode) {
-            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.FALLBACK -> getString(R.string.bfdm_status_fallback)
-            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.GLOBAL -> getString(R.string.bfdm_status_global)
-            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.AUTO -> getString(R.string.bfdm_status_auto)
+            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.FALLBACK -> getString(R.string.bfdm_option_fallback_label)
+            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.GLOBAL -> getString(R.string.bfdm_option_global_label)
+            BlockFreeDnsModeBottomSheet.BlockFreeDnsMode.AUTO -> getString(R.string.bfdm_option_auto_label)
         }
     }
 

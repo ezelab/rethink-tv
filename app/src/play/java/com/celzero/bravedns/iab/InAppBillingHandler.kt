@@ -17,11 +17,10 @@ package com.celzero.bravedns.iab
 
 import Logger
 import Logger.LOG_IAB
+import Logger.LOG_TAG_PROXY
 import android.app.Activity
 import android.content.Context
-import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
-import androidx.lifecycle.asLiveData
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClient.BillingResponseCode
 import com.android.billingclient.api.BillingClient.ProductType
@@ -60,14 +59,19 @@ import com.celzero.bravedns.iab.InAppBillingHandler.serverApiErrorLiveData
 import com.celzero.bravedns.iab.InAppBillingHandler.startStateObserver
 import com.celzero.bravedns.iab.InAppBillingHandler.updateUIForState
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
+import com.celzero.bravedns.rpnproxy.RpnProxyManager.ResetResult
+import com.celzero.bravedns.rpnproxy.RpnProxyManager.getEntitlementDetails
 import com.celzero.bravedns.rpnproxy.RpnProxyManager.getExpiryFromPayload
+import com.celzero.bravedns.rpnproxy.RpnProxyManager.storeWinEntitlement
 import com.celzero.bravedns.rpnproxy.SubscriptionStateMachineV2
 import com.celzero.bravedns.service.EventLogger
 import com.celzero.bravedns.service.PersistentState
+import com.celzero.bravedns.service.VpnController
 import com.google.gson.JsonObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -84,6 +88,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration.Companion.milliseconds
 
 object InAppBillingHandler : KoinComponent {
 
@@ -154,6 +161,11 @@ object InAppBillingHandler : KoinComponent {
     private val billingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val connectionMutex = kotlinx.coroutines.sync.Mutex()
+
+    // Serializes queryProductDetails() so concurrent calls (e.g. onBillingSetupFinished
+    // callback + purchaseSubs on-demand fetch) cannot interleave the clear and async
+    // repopulate of productDetails / storeProductDetails.
+    private val productCacheMutex = kotlinx.coroutines.sync.Mutex()
 
     // state tracking
     @Volatile private var isInitialized = false
@@ -226,9 +238,11 @@ object InAppBillingHandler : KoinComponent {
         // initialize billing client
         setupBillingClient(context)
 
-        // initialize state machine first (before connection)
-        if (!isInitialized) {
-            billingScope.launch {
+        // Serialize state machine init and billing connection in a single
+        // coroutine so the connection (and subsequent purchase reconciliation)
+        // never runs before the machine has transitioned out of Uninitialized.
+        billingScope.launch {
+            if (!isInitialized) {
                 try {
                     subscriptionStateMachine.initialize()
                     startStateObserver()
@@ -236,27 +250,24 @@ object InAppBillingHandler : KoinComponent {
                     logd(mname, "state machine initialized")
                 } catch (e: Exception) {
                     loge(mname, "failed to initialize state machine: ${e.message}", e)
-                    // notify listener on init failures
                     withContext(Dispatchers.Main) {
                         billingListener?.onConnectionResult(false, "State machine initialization failed: ${e.message}")
                     }
                     return@launch
                 }
             }
-        }
 
-        // start billing connection
-        startConnection { isSuccess, message ->
-            if (isSuccess) {
-                logd(mname, "billing connected, fetching initial state")
-                // reset empty-query counters on a fresh connection
-                consecutiveEmptySubsQueries = 0
-                consecutiveEmptyInAppQueries = 0
-                fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
-            } else {
-                loge(mname, "billing connection failed: $message")
+            startConnection { isSuccess, message ->
+                if (isSuccess) {
+                    logd(mname, "billing connected, fetching initial state")
+                    consecutiveEmptySubsQueries = 0
+                    consecutiveEmptyInAppQueries = 0
+                    fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
+                } else {
+                    loge(mname, "billing connection failed: $message")
+                }
+                billingListener?.onConnectionResult(isSuccess, message)
             }
-            billingListener?.onConnectionResult(isSuccess, message)
         }
     }
 
@@ -285,7 +296,7 @@ object InAppBillingHandler : KoinComponent {
 
     fun enableInAppMessaging(activity: Activity) {
         val mname = this::enableInAppMessaging.name
-        if (!isBillingClientSetup()) {
+        if (!isBillingClientSetup() || !billingClient.isReady) {
             logd(mname, "billing client not ready; skipping in-app messages")
             return
         }
@@ -348,6 +359,26 @@ object InAppBillingHandler : KoinComponent {
                 return@launch
             }
 
+            // Safety timeout: force-unlock the mutex after 60 s so a Play callback
+            // that never fires (known behaviour on certain devices) does not
+            // permanently block cancel/revoke operations that also acquire this mutex.
+            val safetyCancelled = AtomicBoolean(false)
+            val safetyJob = billingScope.launch {
+                delay(60_000L.milliseconds)
+                if (!safetyCancelled.get() && connectionMutex.isLocked) {
+                    try { connectionMutex.unlock() } catch (_: Exception) { /* benign race */ }
+                    logd(mname, "connection mutex force-unlocked after safety timeout (60s)")
+                }
+            }
+            val unlock = {
+                if (safetyCancelled.compareAndSet(false, true)) {
+                    safetyJob.cancel()
+                }
+                if (connectionMutex.isLocked) {
+                    try { connectionMutex.unlock() } catch (_: Exception) { /* benign race */ }
+                }
+            }
+
             try {
                 // check if already connected
                 if (::billingClient.isInitialized && billingClient.isReady) {
@@ -356,8 +387,7 @@ object InAppBillingHandler : KoinComponent {
                         queryUtils = QueryUtils(billingClient)
                     }
                     setupProcessors()
-                    // release the mutex acquired above before returning
-                    connectionMutex.unlock()
+                    unlock()
                     withContext(Dispatchers.Main) {
                         callback.invoke(true, "Already connected")
                     }
@@ -376,17 +406,19 @@ object InAppBillingHandler : KoinComponent {
                                 setupProcessors()
                                 queryBillingConfig()
                                 billingScope.launch (Dispatchers.IO) { queryProductDetails() }
-                                fetchPurchases(listOf(ProductType.SUBS, ProductType.INAPP))
                             } else {
                                 loge(mname, "billing connection failed: ${billingResult.responseCode}, ${billingResult.debugMessage}")
                             }
 
                             callback.invoke(isOk, if (isOk) "Connected" else billingResult.debugMessage)
-                            connectionMutex.unlock()
+                            unlock()
                         }
 
                         override fun onBillingServiceDisconnected() {
                             log(mname, "billing service disconnected")
+
+                            storeProductDetails.clear()
+                            productDetails.clear()
 
                             // notify state machine of disconnection
                             billingScope.launch {
@@ -398,9 +430,7 @@ object InAppBillingHandler : KoinComponent {
                             }
 
                             callback.invoke(false, "Service disconnected")
-                            if (connectionMutex.isLocked) {
-                                connectionMutex.unlock()
-                            }
+                            unlock()
                         }
                     })
                 }
@@ -409,9 +439,7 @@ object InAppBillingHandler : KoinComponent {
                 withContext(Dispatchers.Main) {
                     callback.invoke(false, "Connection error: ${e.message}")
                 }
-                if (connectionMutex.isLocked) {
-                    connectionMutex.unlock()
-                }
+                unlock()
             }
         }
     }
@@ -448,14 +476,14 @@ object InAppBillingHandler : KoinComponent {
                                             ?.forEach { purchase ->
                                                 val accountId = purchase.accountIdentifiers?.obfuscatedAccountId
                                                 val storedAccId = getObfuscatedAccountId()
-                                                var isRegistered: Boolean = false
+                                                var isRegistered = false
 
                                                 if (accountId.isNullOrBlank()) {
                                                     loge(mname, "obfuscatedAccountId missing from purchase ${purchase.purchaseToken.take(8)}; skipping registerDevice")
                                                     return@forEach
                                                 }
                                                 if (deviceId == null || accountId != storedAccId) {
-                                                    val didResult = billingBackendClient.createOrRegisterDid(accountId)
+                                                    val didResult = billingBackendClient.reconcileDidForCid(accountId)
                                                     if (didResult.errorCode == 401) {
                                                         loge(mname, "createOrRegisterDid 401 for accountId-len=${accountId.length}; showing auth error")
                                                         handleUnauthorized401(ServerApiError.Operation.CUSTOMER, accountId, "")
@@ -654,40 +682,59 @@ object InAppBillingHandler : KoinComponent {
                                     serverConfirmedValidTokens.add(sub.purchaseToken)
                                     continue
                                 }
-                                val tunnelExpiry: Long = getExpiryFromPayload(updatedDetail.payload) ?: 0L
-                                // billingExpiry is the authoritative local clock for INAPP purchases.
-                                // The VPN session token (tunnelExpiry) can expire weeks or months before
-                                // the billing window ends (e.g. 2 years). Only skip preservation when
-                                // BOTH the session token AND the local billing window are confirmed expired.
-                                // This prevents internet outages or server errors from silently expiring
-                                // an otherwise-valid purchase.
-                                val billingKnownExpired = sub.billingExpiry > 0L &&
-                                    sub.billingExpiry != Long.MAX_VALUE &&
-                                    sub.billingExpiry <= now
-                                logd(mname, "INAPP entitlement for token=${sub.purchaseToken.take(8)}: " +
-                                    "tunnelExpiry=$tunnelExpiry, billingExpiry=${sub.billingExpiry}, " +
-                                    "now=$now, billingKnownExpired=$billingKnownExpired, did=${deviceId.take(8)}")
-                                if (tunnelExpiry > now) {
-                                    // Server returned a fresh, valid session token — definitely preserve.
-                                    logd(mname, "INAPP token=${sub.purchaseToken.take(8)} server-confirmed valid " +
-                                        "(tunnelExpiry=$tunnelExpiry); skipping expire")
-                                    serverConfirmedValidTokens.add(sub.purchaseToken)
-                                } else if (!billingKnownExpired) {
-                                    // Session token has expired (or server/network unavailable) but the
-                                    // local billing window is still open (or unknown).
-                                    // Covers: network errors, 401 (surfaced to UI by queryEntitlementFromServer),
-                                    // 409, server business errors, stale session needing refresh.
-                                    // Billing window is the authority — do NOT expire a valid purchase
-                                    // simply because the server could not be reached.
-                                    logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: tunnelExpiry expired/zero " +
-                                        "but billing window not expired (billingExpiry=${sub.billingExpiry}); " +
-                                        "preserving (fail-safe — internet/server issues must not expire a valid purchase)")
-                                    serverConfirmedValidTokens.add(sub.purchaseToken)
+
+                                // if we got a new valid payload, ensure it's saved in DB and StateMachine
+                                if (updatedDetail.payload.isNotEmpty() && updatedDetail.payload != sub.developerPayload) {
+                                    logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: payload updated from server, syncing...")
+                                    subscriptionStateMachine.paymentSuccessful(updatedDetail)
+                                }
+
+                                // When the server zeroed both expiryTime and the payload, it has
+                                // authoritatively confirmed the subscription is expired.
+                                // This overrides the local billing window — do NOT preserve.
+                                val serverAuthoritativelyExpired = updatedDetail.expiryTime == 0L &&
+                                    updatedDetail.payload.isEmpty() &&
+                                    sub.billingExpiry > 0L
+                                if (serverAuthoritativelyExpired) {
+                                    logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: server authoritatively " +
+                                        "confirmed expired (expiryTime=0, payload cleared); will expire")
+                                    // token intentionally NOT added to serverConfirmedValidTokens
                                 } else {
-                                    // Both the session token AND the local billing window are expired.
-                                    // Allow expireStaleInAppFromDb to handle via the locallyExpired check.
-                                    logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: tunnelExpiry=$tunnelExpiry " +
-                                        "and billing=${sub.billingExpiry} both expired; will expire")
+                                    val tunnelExpiry: Long = getExpiryFromPayload(updatedDetail.payload) ?: 0L
+                                    // billingExpiry is the authoritative local clock for INAPP purchases.
+                                    // The VPN session token (tunnelExpiry) can expire weeks or months before
+                                    // the billing window ends (e.g. 2 years). Only skip preservation when
+                                    // BOTH the session token AND the local billing window are confirmed expired.
+                                    // This prevents internet outages or server errors from silently expiring
+                                    // an otherwise-valid purchase.
+                                    val billingKnownExpired = sub.billingExpiry > 0L &&
+                                        sub.billingExpiry != Long.MAX_VALUE &&
+                                        sub.billingExpiry <= now
+                                    logd(mname, "INAPP entitlement for token=${sub.purchaseToken.take(8)}: " +
+                                        "tunnelExpiry=$tunnelExpiry, billingExpiry=${sub.billingExpiry}, " +
+                                        "now=$now, billingKnownExpired=$billingKnownExpired, did=${deviceId.take(8)}")
+                                    if (tunnelExpiry > now) {
+                                        // Server returned a fresh, valid session token — definitely preserve.
+                                        logd(mname, "INAPP token=${sub.purchaseToken.take(8)} server-confirmed valid " +
+                                            "(tunnelExpiry=$tunnelExpiry); skipping expire")
+                                        serverConfirmedValidTokens.add(sub.purchaseToken)
+                                    } else if (!billingKnownExpired) {
+                                        // Session token has expired (or server/network unavailable) but the
+                                        // local billing window is still open (or unknown).
+                                        // Covers: network errors, 401 (surfaced to UI by queryEntitlementFromServer),
+                                        // 409, server business errors, stale session needing refresh.
+                                        // Billing window is the authority — do NOT expire a valid purchase
+                                        // simply because the server could not be reached.
+                                        logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: tunnelExpiry expired/zero " +
+                                            "but billing window not expired (billingExpiry=${sub.billingExpiry}); " +
+                                            "preserving (fail-safe — internet/server issues must not expire a valid purchase)")
+                                        serverConfirmedValidTokens.add(sub.purchaseToken)
+                                    } else {
+                                        // Both the session token AND the local billing window are expired.
+                                        // Allow expireStaleInAppFromDb to handle via the locallyExpired check.
+                                        logd(mname, "INAPP token=${sub.purchaseToken.take(8)}: tunnelExpiry=$tunnelExpiry " +
+                                            "and billing=${sub.billingExpiry} both expired; will expire")
+                                    }
                                 }
                             } catch (e: Exception) {
                                 loge(mname, "unexpected error checking INAPP entitlement for id=${sub.id}: ${e.message}", e)
@@ -717,8 +764,7 @@ object InAppBillingHandler : KoinComponent {
                 // which is the expected state after a one-time purchase.
                 val pendingProductId = subscriptionStateMachine.getSubscriptionData()
                     ?.subscriptionStatus?.productId ?: ""
-                val pendingIsInApp = pendingProductId == ONE_TIME_PRODUCT_ID || pendingProductId == ONE_TIME_PRODUCT_2YRS || pendingProductId == ONE_TIME_PRODUCT_5YRS
-                        || pendingProductId == ONE_TIME_TEST_PRODUCT_ID
+                val pendingIsInApp = SubscriptionStateMachineV2.isInAppProduct(pendingProductId)
                 val pendingMatchesQueriedType = when (queriedProductType) {
                     ProductType.INAPP -> pendingIsInApp
                     ProductType.SUBS  -> !pendingIsInApp && pendingProductId.isNotBlank()
@@ -749,9 +795,24 @@ object InAppBillingHandler : KoinComponent {
                 consecutiveEmptyInAppQueries = 0
             }
             else -> {
-                logd(mname, "non-empty response, size=${purchasesList?.size}; resetting both empty counters")
-                consecutiveEmptySubsQueries = 0
-                consecutiveEmptyInAppQueries = 0
+                // queriedProductType unknown (e.g. called from purchasesUpdatedListener);
+                // infer the types present and only reset those counters.
+                val hasSubs = normalized.any { getProductType(it, null) == ProductType.SUBS }
+                val hasInApp = normalized.any { getProductType(it, null) == ProductType.INAPP }
+                if (hasSubs) {
+                    logd(mname, "non-empty SUBS (inferred), size=${purchasesList?.size}; resetting SUBS empty counter (was $consecutiveEmptySubsQueries)")
+                    consecutiveEmptySubsQueries = 0
+                }
+                if (hasInApp) {
+                    logd(mname, "non-empty INAPP (inferred), size=${purchasesList?.size}; resetting INAPP empty counter (was $consecutiveEmptyInAppQueries)")
+                    consecutiveEmptyInAppQueries = 0
+                }
+                if (!hasSubs && !hasInApp) {
+                    // No recognizable purchase types; reset both defensively.
+                    logd(mname, "non-empty response, size=${purchasesList?.size}; resetting both empty counters")
+                    consecutiveEmptySubsQueries = 0
+                    consecutiveEmptyInAppQueries = 0
+                }
             }
         }
 
@@ -824,6 +885,12 @@ object InAppBillingHandler : KoinComponent {
             val subsForReconcile = ackedSubs.toMutableList()
             val subsToEscalate   = mutableListOf<Purchase>()
 
+            // Clean up unacked-seen counters for purchases that Play has finally
+            // acknowledged, so the ConcurrentHashMap does not grow unbounded.
+            ackedSubs.forEach { purchase ->
+                unackedSeenCount.remove(purchase.purchaseToken)
+            }
+
             for (purchase in unackedSubs) {
                 val count = unackedSeenCount.merge(purchase.purchaseToken, 1, Int::plus) ?: 1
                 val escalate = count >= UNACK_ESCALATION_THRESHOLD
@@ -879,7 +946,7 @@ object InAppBillingHandler : KoinComponent {
                 consecutiveEmptySubsQueries = 0
                 try {
                     subscriptionStateMachine.reconcileWithPlayBilling(
-                        purchases          = emptyList<Purchase>(),
+                        purchases = emptyList(),
                         queriedProductType = ProductType.SUBS
                     )
                 } catch (e: Exception) {
@@ -993,16 +1060,13 @@ object InAppBillingHandler : KoinComponent {
             return
         }
 
-        // CID has changed (or DID is missing): re-register this device under the new CID.
-        // Call createOrRegisterDid() directly so we can inspect the error code and surface
-        // 401/409 to the UI — getDeviceId(cid) obscures the error by falling through to the
-        // (now stale) stored DID.
+        // Use the mutex-protected reconcileDidForCid to avoid racing with a
+        // concurrent refreshIdentity() call that may also be creating a DID.
         logd(mname, "reconciling did for new cid=${cid.take(8)}")
-        val didResult = billingBackendClient.createOrRegisterDid(cid)
+        val didResult = billingBackendClient.reconcileDidForCid(cid)
         when {
             didResult.isSuccess -> {
-                logd(mname, "reconcile succeeded; persisting new (cid, did)")
-                secureIdentityStore.save(env, cid, didResult.deviceId)
+                logd(mname, "reconcile succeeded; did persisted by BillingBackendClient (len=${didResult.deviceId.length})")
             }
             didResult.errorCode == 401 -> {
                 loge(mname, "401 unauthorized on device re-registration for cid=${cid.take(8)}; surfacing auth error")
@@ -1015,6 +1079,82 @@ object InAppBillingHandler : KoinComponent {
             else -> {
                 loge(mname, "device re-registration failed (code=${didResult.errorCode}) for cid=${cid.take(8)}; non-fatal")
             }
+        }
+    }
+
+    suspend fun reconcilePurchase() {
+        val mname = this::reconcilePurchase.name
+        val thresholdToCheckWinExpiryTs: Long = TimeUnit.DAYS.toMillis(10) // 10 days in ms
+        // time when the entitlement reconciliation should be considered CONST
+        val expiryDifferenceTs: Long = TimeUnit.DAYS.toMillis(30) // 30 days in ms
+
+        val activePurchase = getActivePurchasesSnapshot()
+        // reconcile only when entitlement expiry is ahead of windscribe expiry by at least
+        // thresholdToCheckWinExpiryTs. Smaller differences are ignored by the server
+        val entitlement = getEntitlementDetails()
+        val entitlementExpiry = entitlement?.expiry()
+
+        if (activePurchase.isEmpty()) return
+
+        if (entitlementExpiry == null) {
+            logd(mname, "missing entitlement expiry, skipping reconcile")
+            return
+        }
+
+        val windscribeExpiry = VpnController.getWinExpiryTs()
+
+        if (windscribeExpiry == null) {
+            logd(mname, "missing entitlement or win expiry, skipping reconcile")
+            return
+        }
+
+        if (windscribeExpiry > entitlementExpiry) {
+            logd(mname, "win expiry is ahead of entitlement expiry, skipping reconcile")
+            return
+        }
+
+        // if the value of the win expiry is less than 30 days then start checking
+        val now = System.currentTimeMillis()
+        if (windscribeExpiry - now > expiryDifferenceTs) {
+            logd(mname, "win expiry is beyond threshold, skipping reconcile")
+            return
+        }
+
+        if (entitlementExpiry - windscribeExpiry < thresholdToCheckWinExpiryTs) {
+            logd(mname, "expiry gap is below reconciliation threshold, skipping reconcile")
+            return
+        }
+
+        // fetch entitlement and reconcile with the purchase
+        val purchaseDtl = subscriptionStateMachine.getSubscriptionData()?.purchaseDetail
+        if (purchaseDtl == null) {
+            loge(mname, "missing purchase detail, skipping reconcile")
+            return
+        }
+
+        // windscribe entitlement can be less than what the expiry which user has purchased
+        // (entitlement expiry), if the value of the win expiry is less than 30
+        // [thresholdToCheckWinExpiryTs] days then start checking for the windscribe expiry
+        val newPurchaseDtl = queryEntitlementFromServer(getObfuscatedAccountId(), getObfuscatedDeviceId(), purchaseDtl)
+        try {
+            storeWinEntitlement(newPurchaseDtl.payload)
+            log(mname, "new entitlement updated")
+        } catch (e: Exception) {
+            loge(mname, "storeWinEntitlement failed: ${e.message}", e)
+            return
+        }
+
+        // Update state machine with fresh payload (non-fatal)
+        try {
+            val subsData = subscriptionStateMachine.getSubscriptionData()
+            if (subsData != null) {
+                subsData.subscriptionStatus.developerPayload = newPurchaseDtl.payload
+                val updatedSubsData = subsData.copy(purchaseDetail = newPurchaseDtl)
+                subscriptionStateMachine.stateMachine.updateData(updatedSubsData)
+                log(mname, "state machine payload updated")
+            }
+        } catch (e: Exception) {
+            loge(mname, "state machine update failed (non-fatal): ${e.message}")
         }
     }
 
@@ -1189,7 +1329,7 @@ object InAppBillingHandler : KoinComponent {
             deviceId = if (getObfuscatedDeviceId().isNotBlank()) SubscriptionStatus.DEVICE_ID_INDICATOR else "",
             payload = purchase.developerPayload,
             expiryTime = 0L,
-            status = SubscriptionStatus.SubscriptionState.STATE_UNKNOWN.id,
+            status = purchase.purchaseState.toSubscriptionStatusId(),
             windowDays = REVOKE_WINDOW_SUBS_MONTHLY_DAYS,
             orderId = purchase.orderId ?: ""
         )
@@ -1284,9 +1424,10 @@ object InAppBillingHandler : KoinComponent {
     private fun resolveOneTimeRevokeDays(productId: String): Int = when (productId) {
         ONE_TIME_PRODUCT_2YRS -> REVOKE_WINDOW_ONE_TIME_2YRS_DAYS
         ONE_TIME_PRODUCT_5YRS -> REVOKE_WINDOW_ONE_TIME_5YRS_DAYS
-        ONE_TIME_PRODUCT_ID -> REVOKE_WINDOW_SUBS_MONTHLY_DAYS
+        // Legacy one-time product has the same 2-year access window as ONE_TIME_PRODUCT_2YRS.
+        ONE_TIME_PRODUCT_ID -> REVOKE_WINDOW_ONE_TIME_2YRS_DAYS
         ONE_TIME_TEST_PRODUCT_ID -> REVOKE_WINDOW_SUBS_MONTHLY_DAYS
-        else -> REVOKE_WINDOW_SUBS_MONTHLY_DAYS
+        else -> REVOKE_WINDOW_ONE_TIME_2YRS_DAYS // conservative default for unknown one-time products
     }
 
     private fun Int.toSubscriptionStatusId(): Int = when (this) {
@@ -1402,6 +1543,9 @@ object InAppBillingHandler : KoinComponent {
 
     /**
      * resolves product type from the known product-ID set.
+     *
+     * ONE_TIME_PRODUCT_2YRS ("proxy-yearly-2") and ONE_TIME_PRODUCT_5YRS ("proxy-yearly-5") are
+     * standalone INAPP product IDs distinct from ONE_TIME_PRODUCT_ID ("onetime.tier").
      */
     private fun resolveProductTypeFromKnownIds(productId: String): String {
         val mname = "resolveProductTypeFromKnownIds"
@@ -1434,6 +1578,10 @@ object InAppBillingHandler : KoinComponent {
     }
 
     fun fetchPurchases(productType: List<String>) {
+        if (!isBillingClientSetup()) {
+            loge("fetchPurchases", "billing client not setup, cannot fetch purchases")
+            return
+        }
         billingScope.launch {
             val mname = "fetchPurchases"
             logv(mname, "fetching purchases for types: $productType")
@@ -1459,6 +1607,10 @@ object InAppBillingHandler : KoinComponent {
     }
 
     private fun queryPurchases(pt: String, hasBoth: Boolean) {
+        if (!::billingClient.isInitialized) {
+            loge("queryPurchases", "billingClient not initialized, cannot query purchases for $pt")
+            return
+        }
         val mname = this::queryPurchases.name
         log(mname, "querying purchases for type: $pt, hasBoth: $hasBoth")
 
@@ -1471,7 +1623,8 @@ object InAppBillingHandler : KoinComponent {
                     log(mname, "purchase ($index): $purchase")
                 }
             }
-            if (BillingResponse(result.responseCode).isOk) {
+
+            val processingJob = if (BillingResponse(result.responseCode).isOk) {
                 billingScope.launch {
                     try {
                         logv(mname, "processing($pt) ${purchases.size} purchases")
@@ -1482,11 +1635,18 @@ object InAppBillingHandler : KoinComponent {
                 }
             } else {
                 loge(mname, "err in query purchases response $pt: ${result.responseCode}, ${result.debugMessage}")
+                null
             }
 
-            // query SUBS if we were querying INAPP and hasBoth is true
+            // Chain SUBS query AFTER INAPP processing completes so the two
+            // handlePurchase calls cannot run concurrently on Dispatchers.IO and
+            // race on DB writes.  On INAPP query error, fire immediately.
             if (pt == ProductType.INAPP && hasBoth) {
-                queryPurchases(ProductType.SUBS, false)
+                if (processingJob != null) {
+                    processingJob.invokeOnCompletion { queryPurchases(ProductType.SUBS, false) }
+                } else {
+                    queryPurchases(ProductType.SUBS, false)
+                }
             }
         }
     }
@@ -1519,13 +1679,14 @@ object InAppBillingHandler : KoinComponent {
 
     private suspend fun queryProductDetails() {
         val mname = this::queryProductDetails.name
-        // clear before a fresh query so stale data doesn't leak into results.
-        storeProductDetails.clear()
-        productDetails.clear()
+        productCacheMutex.withLock {
+            // clear before a fresh query so stale data doesn't leak into results.
+            storeProductDetails.clear()
+            productDetails.clear()
 
-        // launch INAPP and SUBS queries concurrently and await both.
-        val inAppResult = kotlinx.coroutines.CompletableDeferred<List<ProductDetails>>()
-        val subsResult  = kotlinx.coroutines.CompletableDeferred<List<ProductDetails>>()
+            // launch INAPP and SUBS queries concurrently and await both.
+            val inAppResult = kotlinx.coroutines.CompletableDeferred<List<ProductDetails>>()
+            val subsResult  = kotlinx.coroutines.CompletableDeferred<List<ProductDetails>>()
 
         val inAppParams = QueryProductDetailsParams.newBuilder()
             .setProductList(
@@ -1583,6 +1744,7 @@ object InAppBillingHandler : KoinComponent {
             productDetailsLiveData.postValue(merged)
             billingListener?.productResult(merged.isNotEmpty(), merged)
         }
+        } // productCacheMutex.withLock
     }
 
 
@@ -1790,7 +1952,7 @@ object InAppBillingHandler : KoinComponent {
         if (pd == null) {
             log(mname, "product not found in cache (size=${storeProductDetails.size}), fetching on-demand and retrying")
             try {
-                withTimeoutOrNull(10_000) { queryProductDetails() }
+                withTimeoutOrNull(10_000.milliseconds) { queryProductDetails() }
             } catch (e: Exception) {
                 loge(mname, "on-demand product details fetch failed: ${e.message}", e)
             }
@@ -1860,10 +2022,24 @@ object InAppBillingHandler : KoinComponent {
             }
         }
 
-        val queryProductDetail = storeProductDetails.find {
+        var queryProductDetail = storeProductDetails.find {
             it.productDetail.productId == productId &&
                     it.productDetail.productType == ProductType.INAPP &&
                     it.productDetail.planId == planId
+        }
+
+        if (queryProductDetail == null) {
+            log(mname, "one-time product not found in cache (size=${storeProductDetails.size}), fetching on-demand and retrying")
+            try {
+                withTimeoutOrNull(10_000.milliseconds) { queryProductDetails() }
+            } catch (e: Exception) {
+                loge(mname, "on-demand product details fetch failed: ${e.message}", e)
+            }
+            queryProductDetail = storeProductDetails.find {
+                it.productDetail.productId == productId &&
+                        it.productDetail.productType == ProductType.INAPP &&
+                        it.productDetail.planId == planId
+            }
         }
 
         if (queryProductDetail == null) {
@@ -1949,6 +2125,13 @@ object InAppBillingHandler : KoinComponent {
             .setProductDetailsParamsList(paramsList)
             .setObfuscatedAccountId(accountId)
             .build()
+
+        if (!billingClient.isReady) {
+            loge(mname, "billing client no longer ready; aborting launchBillingFlow to avoid ProxyBillingActivity NPE")
+            try { subscriptionStateMachine.purchaseFailed("Billing client disconnected before launch", null) } catch (_: Exception) {}
+            billingListener?.purchasesResult(false, emptyList())
+            return
+        }
 
         val billingResult = billingClient.launchBillingFlow(activity, flowParams)
         val isSuccess = billingResult.responseCode == BillingResponseCode.OK
@@ -2452,7 +2635,7 @@ object InAppBillingHandler : KoinComponent {
      * Revoke a one-time (INAPP) purchase (full refund within revoke window).
      *
      * Mirrors [revokeSubscription] exactly but uses the correct one-time product SKU.
-     * Calls [ITcpProxy.revokeSubscription] → updates local state → fires
+     * Calls [revokeSubscription] → updates local state → fires
      * [SubscriptionStateMachineV2.subscriptionRevoked].
      *
      * @param accountId    Obfuscated account ID.
@@ -2517,13 +2700,7 @@ object InAppBillingHandler : KoinComponent {
      */
     fun getRemainingDaysForInApp(): Long? {
         val sub = subscriptionStateMachine.getSubscriptionData()?.subscriptionStatus ?: return null
-        // only compute remaining days for INAPP products
-        val isInApp = sub.productId.contains("onetime", ignoreCase = true) ||
-                sub.productId.contains("inapp", ignoreCase = true) ||
-                sub.productId == ONE_TIME_TEST_PRODUCT_ID ||
-                sub.productId == ONE_TIME_PRODUCT_2YRS ||
-                sub.productId == ONE_TIME_PRODUCT_5YRS ||
-                sub.productId == ONE_TIME_PRODUCT_ID
+        val isInApp = SubscriptionStateMachineV2.isInAppProduct(sub.productId)
         if (!isInApp) return null
         val expiry = sub.billingExpiry
         // TODO: should we check with the vpnAdapter?.winExpiry here?
@@ -2544,12 +2721,7 @@ object InAppBillingHandler : KoinComponent {
             loge(mname, "no subscription data available in state machine; cannot calculate remaining days for INAPP")
             return null
         }
-        val isInApp = sub.productId.contains("onetime", ignoreCase = true) ||
-                sub.productId.contains("inapp", ignoreCase = true) ||
-                sub.productId == ONE_TIME_TEST_PRODUCT_ID ||
-                sub.productId == ONE_TIME_PRODUCT_2YRS ||
-                sub.productId == ONE_TIME_PRODUCT_5YRS ||
-                sub.productId == ONE_TIME_PRODUCT_ID
+        val isInApp = SubscriptionStateMachineV2.isInAppProduct(sub.productId)
         if (!isInApp) {
             loge(mname, "Current subscription is not an INAPP product; cannot calculate remaining days for INAPP")
             return null
@@ -2649,7 +2821,8 @@ object InAppBillingHandler : KoinComponent {
     suspend fun queryEntitlementFromServer(accountId: String, deviceId: String, purchase: PurchaseDetail): PurchaseDetail {
         val mname = this::queryEntitlementFromServer.name
         logd(mname, "delegating to BillingServerRepository, accLen=${accountId.length}")
-        val pt = purchase.purchaseToken.ifEmpty { getLatestPurchaseToken() } ?: run {
+        val pt = purchase.purchaseToken
+        if (pt.isEmpty()) {
             logd(mname, "no purchase token; skipping")
             return purchase
         }
@@ -2672,28 +2845,30 @@ object InAppBillingHandler : KoinComponent {
                 purchase
             }
             is QueryEntitlementResult.Failure -> {
-                // Server responded with a business error (e.g. purchase cancelled/revoked).
-                // Preserve the original purchase; the local billing expiry is the authority.
-                loge(mname, "queryEntitlement server business error for token=${pt.take(8)}; preserving original purchase")
+                // Server responded with a business error (e.g. purchase canceled/revoked).
                 // If the server included a linkedPurchaseId, the revoked purchase may have been
-                // superseded by an older one that is still valid.  Attempt to reactivate it so
+                // superseded by an older one that is still valid. Attempt to reactivate it so
                 // the user is not left in a broken state.
                 val linked = result.linkedPurchaseId
                 if (!linked.isNullOrBlank()) {
-                    logd(mname, "linkedPurchaseId present for token=${pt.take(8)}; attempting reactivation of linkedToken=${linked.take(8)}")
+                    loge(mname, "queryEntitlement server business error for token=${pt.take(8)}; linkedPurchaseId present, attempting reactivation of linkedToken=${linked.take(8)}")
                     try {
                         RpnProxyManager.tryReactivateLinkedPurchase(accountId, deviceId, linked)
                     } catch (e: Exception) {
                         loge(mname, "tryReactivateLinkedPurchase threw for linkedToken=${linked.take(8)}: ${e.message}", e)
                     }
+                    result.purchase
+                } else {
+                    // server informed that this purchase has failed with nothing to fall back on.
+                    // Treat the same as Expired: clear the payload and zero the expiry so
+                    // downstream callers stop treating this as a valid entitlement.
+                    loge(mname, "queryEntitlement server business error for token=${pt.take(8)}; no linkedPurchaseId, expiring local purchase")
+                    result.purchase.copy(expiryTime = 0L, payload = "")
                 }
-                result.purchase
             }
             is QueryEntitlementResult.Expired -> {
                 // Server has authoritatively confirmed the subscription is expired.
-                // Do NOT preserve the old purchase — clear the payload and zero the expiry so
-                // every downstream caller (RpnProxyManager, state machine, SubscriptionCheckWorker)
-                // treats this as an expired entitlement rather than re-storing the old one.
+                // treat this as an expired entitlement rather than re-storing the old one.
                 loge(mname, "queryEntitlement server confirmed subscription expired for token=${pt.take(8)}; expiring local purchase")
                 result.purchase.copy(expiryTime = 0L, payload = "")
             }
@@ -2729,16 +2904,8 @@ object InAppBillingHandler : KoinComponent {
         return Pair(success, payload)
     }
 
-    fun getLatestPurchaseToken(): String? {
-        return purchasesLiveData.value?.maxByOrNull { it.purchaseTime }?.purchaseToken
-    }
-
     fun getSubscriptionState(): SubscriptionStateMachineV2.SubscriptionState {
         return subscriptionStateMachine.getCurrentState()
-    }
-
-    fun getSubscriptionStateLiveData(): LiveData<SubscriptionStateMachineV2.SubscriptionState> {
-        return subscriptionStateMachine.currentState.asLiveData()
     }
 
     fun getSubscriptionStateFlow(): StateFlow<SubscriptionStateMachineV2.SubscriptionState> {

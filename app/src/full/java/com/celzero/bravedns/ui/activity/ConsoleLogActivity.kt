@@ -26,25 +26,32 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.view.inputmethod.InputMethodManager
+import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
-import com.celzero.bravedns.ui.BaseActivity
+import androidx.appcompat.widget.SearchView
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.paging.PagingData
+import androidx.paging.filter
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.celzero.bravedns.R
+import com.celzero.bravedns.RethinkDnsApplication.Companion.DEBUG
 import com.celzero.bravedns.adapter.ConsoleLogAdapter
+import com.celzero.bravedns.database.ConsoleLog
 import com.celzero.bravedns.database.ConsoleLogRepository
 import com.celzero.bravedns.databinding.ActivityConsoleLogBinding
 import com.celzero.bravedns.net.go.GoVpnAdapter
 import com.celzero.bravedns.scheduler.BugReportZipper
 import com.celzero.bravedns.scheduler.WorkScheduler
 import com.celzero.bravedns.service.PersistentState
+import com.celzero.bravedns.service.VpnController
+import com.celzero.bravedns.ui.BaseActivity
 import com.celzero.bravedns.util.Constants
 import com.celzero.bravedns.util.SnackbarHelper.capitalizeWords
 import com.celzero.bravedns.util.Themes
@@ -55,6 +62,7 @@ import com.celzero.bravedns.util.disableFrostTemporarily
 import com.celzero.bravedns.util.handleFrostEffectIfNeeded
 import com.celzero.bravedns.util.restoreFrost
 import com.celzero.bravedns.viewmodel.ConsoleLogViewModel
+import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -65,8 +73,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
 import java.io.File
+import kotlin.time.Duration.Companion.milliseconds
 
-class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx.appcompat.widget.SearchView.OnQueryTextListener {
+class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), SearchView.OnQueryTextListener {
 
     private val b by viewBinding(ActivityConsoleLogBinding::bind)
     private var layoutManager: RecyclerView.LayoutManager? = null
@@ -80,10 +89,20 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
         private const val FILE_NAME = "rethink_app_logs_"
         private const val FILE_EXTENSION = ".zip"
         private const val QUERY_TEXT_DELAY: Long = 1000
+        private const val CRASH_CODE = "**CRASH0**"
+        private const val DONT_PANIC_CODE = "**CRASH1**"
+        private const val PANIC_CRASH_CODE = "**CRASH2**"
     }
 
-    // Guard against rapid double-taps on share buttons while a job is in-flight
+    // Guard against rapid double-taps on share buttons while a job is in-progress
     private var isShareInProgress = false
+
+    // When true, ignore updates from the database so the ui
+    private var isPaused: Boolean = false
+
+    private var currentFilter: String = ""
+
+    private var currentMinLevel: Int = 0
 
     private fun Context.isDarkThemeOn(): Boolean {
         return resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
@@ -98,7 +117,7 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
 
         if (isAtleastQ()) {
             val controller = WindowInsetsControllerCompat(window, window.decorView)
-            controller.isAppearanceLightNavigationBars = false
+            controller.isAppearanceLightNavigationBars = Themes.isActivityLightTheme(isDarkThemeOn(), persistentState.theme)
             window.isNavigationBarContrastEnforced = false
         }
         initView()
@@ -110,10 +129,16 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
     private fun setQueryFilter() {
         lifecycleScope.launch {
             searchQuery
-                .debounce(QUERY_TEXT_DELAY)
+                .debounce(QUERY_TEXT_DELAY.milliseconds)
                 .distinctUntilChanged()
                 .collect { query ->
-                    viewModel.setFilter(query)
+                    currentFilter = query
+                    if (isPaused) {
+                        // apply filters in local paging data instead of database
+                        reapplyLocalFilter()
+                    } else {
+                        viewModel.setFilter(query)
+                    }
                 }
         }
     }
@@ -134,6 +159,11 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
     }
 
     private fun initView() {
+        if (DEBUG) {
+            b.pauseIcon.visibility = View.VISIBLE
+        } else {
+            b.pauseIcon.visibility = View.GONE
+        }
         setAdapter()
         // update the text view with the time since logs are available
         io {
@@ -174,10 +204,26 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
                     }
                 }
             }
+            // Disable RecyclerView's GapWorker-driven item prefetch on this list.
+            // The console log is updated at very high frequency by background logging
+            // coroutines (Paging 3 inserts), and prefetch races with the paging
+            // update path to produce the IndexOutOfBoundsException in ConsoleLogAdapter
+            // reported as #2591 ("v055u: IndexOutOfBoundsException ConsoleLogAdapter").
+            // The existing try/catch above SWALLOWS the exception when it does fire;
+            // this prevents the race that causes it. Trade-off: marginally slower
+            // scroll because the next item is bound on-demand instead of one-frame
+            // ahead. For a debug log view that's a non-issue.
+            //
+            // Note: ConnectionTrackerFragment / DnsLogFragment elsewhere in this app
+            // explicitly enable prefetch (lm.isItemPrefetchEnabled = true). The
+            // console log has a fundamentally higher write rate so the default needs
+            // to differ.
+            (layoutManager as? LinearLayoutManager)?.isItemPrefetchEnabled = false
 
             b.consoleLogList.layoutManager = layoutManager
             recyclerAdapter = ConsoleLogAdapter(this)
             b.consoleLogList.adapter = recyclerAdapter
+            currentMinLevel = Logger.uiLogLevel.toInt()
             viewModel.setLogLevel(Logger.uiLogLevel)
             observeLog()
         } catch (e: Exception) {
@@ -185,10 +231,30 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
         }
     }
 
+    private var lastPagingData: PagingData<ConsoleLog>? = null
+
     private fun observeLog() {
         viewModel.logs.observe(this) { pagingData ->
-            recyclerAdapter?.submitData(lifecycle, pagingData)
+            lastPagingData = pagingData
+            val toSubmit = applyLocalFilter(pagingData)
+            recyclerAdapter?.submitData(lifecycle, toSubmit)
         }
+    }
+
+    private fun applyLocalFilter(pagingData: PagingData<ConsoleLog>): PagingData<ConsoleLog> {
+        val q = currentFilter
+        val lvl = currentMinLevel
+        if (q.isEmpty() && lvl <= 0) return pagingData
+        return pagingData.filter { log ->
+            val matchesText = q.isEmpty() || log.message.contains(q, ignoreCase = true)
+            val matchesLevel = lvl <= 0 || log.level >= lvl
+            matchesText && matchesLevel
+        }
+    }
+
+    private fun reapplyLocalFilter() {
+        val pd = lastPagingData ?: return
+        recyclerAdapter?.submitData(lifecycle, applyLocalFilter(pd))
     }
     private fun setupClickListener() {
 
@@ -230,6 +296,23 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
         b.searchFilterIcon.setOnClickListener {
             showFilterDialog()
         }
+
+        b.pauseIcon.setOnClickListener {
+            togglePause()
+        }
+    }
+
+    private fun togglePause() {
+        isPaused = !isPaused
+        if (isPaused) {
+            b.pauseIcon.setImageResource(R.drawable.ic_prevent_dns_proxy)
+            Logger.i(LOG_TAG_BUG_REPORT, "console log stream paused")
+        } else {
+            b.pauseIcon.setImageResource(R.drawable.ic_pause)
+            // fresh stream of data is emitted, which the observer will forward to the adapter.
+            viewModel.restartLogStream()
+            Logger.i(LOG_TAG_BUG_REPORT, "console log stream resumed")
+        }
     }
 
     private fun showFilterDialog() {
@@ -254,14 +337,53 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
             Logger.uiLogLevel = which.toLong()
             GoVpnAdapter.setLogLevel(
                 persistentState.goLoggerLevel.toInt(),
-                Logger.uiLogLevel.toInt()
+                Logger.uiLogLevel.toInt(),
+                persistentState.includeFileTrace
             )
-            viewModel.setLogLevel(which.toLong())
+            currentMinLevel = which
+            if (isPaused) {
+                // apply the level filter on the local paging data only; do not
+                // refetch from the DB while paused.
+                reapplyLocalFilter()
+            } else {
+                viewModel.setLogLevel(which.toLong())
+            }
             if (which < Logger.LoggerLevel.ERROR.id) {
                 consoleLogRepository.setStartTimestamp(System.currentTimeMillis())
             }
             Logger.i(LOG_TAG_BUG_REPORT, "Log level set to ${items[which]}")
         }
+
+        val cb = MaterialCheckBox(this)
+        cb.text = getString(R.string.console_log_include_file_trace)
+        cb.isChecked = persistentState.includeFileTrace
+        cb.setOnCheckedChangeListener { _, isChecked ->
+            persistentState.includeFileTrace = isChecked
+            GoVpnAdapter.setLogLevel(
+                persistentState.goLoggerLevel.toInt(),
+                Logger.uiLogLevel.toInt(),
+                persistentState.includeFileTrace
+            )
+            currentMinLevel = Logger.uiLogLevel.toInt()
+            if (isPaused) {
+                reapplyLocalFilter()
+            } else {
+                viewModel.setLogLevel(Logger.uiLogLevel)
+            }
+            Logger.i(LOG_TAG_BUG_REPORT, "File trace set to $isChecked")
+        }
+        val density = resources.displayMetrics.density
+        val margin = (20 * density).toInt()
+        val container = LinearLayout(this)
+        val params =
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        params.setMargins(margin, 0, margin, 0)
+        container.addView(cb, params)
+        builder.setView(container)
+
         builder.setCancelable(true)
         builder.setPositiveButton(getString(R.string.fapps_info_dialog_positive_btn)) { dialogInterface, _ ->
             dialogInterface.dismiss()
@@ -435,13 +557,42 @@ class ConsoleLogActivity : BaseActivity(R.layout.activity_console_log), androidx
     val searchQuery = MutableStateFlow("")
     @OptIn(FlowPreview::class)
     override fun onQueryTextSubmit(query: String): Boolean {
+        if (query == CRASH_CODE) {
+            // 0: default, 1: don't panic
+            // 0: will crash, gowtf
+            // 1: won't crash, write to stack trace
+            crashTun(0L)
+            return true
+        } else if (query == DONT_PANIC_CODE) {
+            crashTun(1L)
+            return true
+        }
         searchQuery.value = query
         return true
     }
 
     @OptIn(FlowPreview::class)
     override fun onQueryTextChange(query: String): Boolean {
+        if (query == CRASH_CODE) {
+            // 0: default, 1: don't panic
+            // 0: will crash, gowtf
+            // 1: won't crash, write to stack trace
+            crashTun(0L)
+            return true
+        } else if (query == DONT_PANIC_CODE) {
+            crashTun(1L)
+            return true
+        } else if (query == PANIC_CRASH_CODE) {
+            crashTun(2L)
+            return true
+        }
         searchQuery.value = query
         return true
+    }
+
+    private fun crashTun(type: Long) {
+        io {
+            VpnController.crashTun(type)
+        }
     }
 }
